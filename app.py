@@ -3,9 +3,34 @@ Streamlit web interface for the Wiom UAF Communication Briefing Agent.
 Run with: streamlit run app.py
 """
 
+import os
+
 import streamlit as st
 from agent import BriefingAgent
 from knowledge_base import get_brief_count, get_correction_count
+
+
+def get_api_key():
+    """
+    Get API key from available sources, in order:
+    1. Streamlit secrets (for cloud deployment - stakeholders never see this)
+    2. Environment variable (for local/server deployment)
+    3. None (will show input prompt as fallback)
+    """
+    # Streamlit Cloud secrets
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+
+    # Environment variable
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return key
+
+    return None
 
 
 def init_session():
@@ -15,6 +40,22 @@ def init_session():
         st.session_state.chat_history = []
         st.session_state.initialized = False
         st.session_state.api_key_set = False
+
+
+def try_auto_start():
+    """Auto-start if API key is available from secrets or env. No prompt needed."""
+    if st.session_state.api_key_set:
+        return True
+
+    api_key = get_api_key()
+    if api_key:
+        try:
+            st.session_state.agent = BriefingAgent(api_key=api_key)
+            st.session_state.api_key_set = True
+            return True
+        except Exception:
+            return False
+    return False
 
 
 def render_sidebar():
@@ -37,14 +78,13 @@ def render_sidebar():
 
             # Section-by-section breakdown
             st.subheader("Sections")
-            if st.session_state.agent:
-                for section_key, section in st.session_state.agent.brief.items():
-                    section_complete = sum(
-                        1 for f in section["fields"].values() if f["status"] == "complete"
-                    )
-                    section_total = len(section["fields"])
-                    icon = "✅" if section_complete == section_total else "⏳"
-                    st.text(f"{icon} {section['label']} ({section_complete}/{section_total})")
+            for section_key, section in st.session_state.agent.brief.items():
+                section_complete = sum(
+                    1 for f in section["fields"].values() if f["status"] == "complete"
+                )
+                section_total = len(section["fields"])
+                icon = "done" if section_complete == section_total else "pending"
+                st.text(f"[{icon}] {section['label']} ({section_complete}/{section_total})")
 
         st.divider()
 
@@ -57,15 +97,16 @@ def render_sidebar():
 
         st.divider()
 
-        if st.button("New Briefing", use_container_width=True):
-            st.session_state.agent = None
+        if st.button("Start New Briefing", use_container_width=True):
+            api_key = get_api_key()
+            st.session_state.agent = BriefingAgent(api_key=api_key) if api_key else None
             st.session_state.chat_history = []
             st.session_state.initialized = False
             st.rerun()
 
 
 def render_api_key_input():
-    """Render API key input if not set."""
+    """Render API key input only when no key is configured server-side."""
     st.title("Wiom UAF Communication Briefing Agent")
     st.markdown(
         "Help stakeholders define and validate communication requirements "
@@ -73,6 +114,12 @@ def render_api_key_input():
     )
 
     st.divider()
+
+    st.info(
+        "No API key is configured on this server. "
+        "Ask your admin to add ANTHROPIC_API_KEY to the deployment secrets, "
+        "or enter one below to get started."
+    )
 
     api_key = st.text_input(
         "Anthropic API Key",
@@ -139,17 +186,19 @@ def render_chat():
 def main():
     st.set_page_config(
         page_title="Wiom UAF Briefing Agent",
-        page_icon="📋",
+        page_icon="clipboard",
         layout="wide",
     )
 
     init_session()
 
-    if not st.session_state.api_key_set:
-        render_api_key_input()
-    else:
+    if try_auto_start():
+        # API key found in secrets/env - stakeholders land directly in chat
         render_sidebar()
         render_chat()
+    else:
+        # No key configured - show manual input as fallback
+        render_api_key_input()
 
 
 if __name__ == "__main__":
