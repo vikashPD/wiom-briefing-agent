@@ -10,25 +10,30 @@ from agent import BriefingAgent
 from knowledge_base import get_brief_count, get_correction_count
 
 
-def get_api_key():
+def get_configured_key(provider):
     """
-    Get API key from available sources, in order:
-    1. Streamlit secrets (for cloud deployment - stakeholders never see this)
-    2. Environment variable (for local/server deployment)
-    3. None (will show input prompt as fallback)
+    Get API key from secrets or env for the given provider.
+    Returns the key or None.
     """
-    # Streamlit Cloud secrets
+    if provider == "gemini":
+        env_keys = ["GOOGLE_API_KEY", "GEMINI_API_KEY"]
+    else:
+        env_keys = ["ANTHROPIC_API_KEY"]
+
+    # Check Streamlit secrets first
     try:
-        key = st.secrets.get("ANTHROPIC_API_KEY")
-        if key:
-            return key
+        for k in env_keys:
+            val = st.secrets.get(k)
+            if val:
+                return val
     except Exception:
         pass
 
-    # Environment variable
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        return key
+    # Check environment
+    for k in env_keys:
+        val = os.environ.get(k)
+        if val:
+            return val
 
     return None
 
@@ -39,19 +44,16 @@ def init_session():
         st.session_state.agent = None
         st.session_state.chat_history = []
         st.session_state.initialized = False
-        st.session_state.api_key_set = False
+        st.session_state.started = False
 
 
-def try_auto_start():
-    """Auto-start if API key is available from secrets or env. No prompt needed."""
-    if st.session_state.api_key_set:
-        return True
-
-    api_key = get_api_key()
-    if api_key:
+def try_auto_start(provider):
+    """Auto-start if API key is available from secrets/env."""
+    key = get_configured_key(provider)
+    if key:
         try:
-            st.session_state.agent = BriefingAgent(api_key=api_key)
-            st.session_state.api_key_set = True
+            st.session_state.agent = BriefingAgent(provider=provider, api_key=key)
+            st.session_state.started = True
             return True
         except Exception:
             return False
@@ -66,17 +68,16 @@ def render_sidebar():
         if st.session_state.agent:
             progress = st.session_state.agent.get_progress()
             st.progress(progress["pct"] / 100)
-            st.metric("Complete", f"{progress['complete']}/{progress['total']}")
+            st.metric("Complete", "{}/{}".format(progress["complete"], progress["total"]))
             st.metric("Missing Mandatory", progress["missing_mandatory"])
 
             if progress["missing_mandatory"] == 0:
                 st.success("All mandatory fields complete!")
             else:
-                st.warning(f"{progress['missing_mandatory']} mandatory fields remaining")
+                st.warning("{} mandatory fields remaining".format(progress["missing_mandatory"]))
 
             st.divider()
 
-            # Section-by-section breakdown
             st.subheader("Sections")
             for section_key, section in st.session_state.agent.brief.items():
                 section_complete = sum(
@@ -84,70 +85,76 @@ def render_sidebar():
                 )
                 section_total = len(section["fields"])
                 icon = "done" if section_complete == section_total else "pending"
-                st.text(f"[{icon}] {section['label']} ({section_complete}/{section_total})")
+                st.text("[{}] {} ({}/{})".format(icon, section["label"], section_complete, section_total))
 
         st.divider()
 
-        # Knowledge base stats
         st.subheader("Knowledge Base")
         briefs = get_brief_count()
         corrections = get_correction_count()
-        st.text(f"Past briefs: {briefs}")
-        st.text(f"Corrections: {corrections}")
+        st.text("Past briefs: {}".format(briefs))
+        st.text("Corrections: {}".format(corrections))
 
         st.divider()
 
         if st.button("Start New Briefing", use_container_width=True):
-            api_key = get_api_key()
-            st.session_state.agent = BriefingAgent(api_key=api_key) if api_key else None
+            provider = st.session_state.agent.provider if st.session_state.agent else "gemini"
+            key = get_configured_key(provider)
+            st.session_state.agent = BriefingAgent(provider=provider, api_key=key) if key else None
             st.session_state.chat_history = []
             st.session_state.initialized = False
             st.rerun()
 
 
-def render_api_key_input():
-    """Render API key input only when no key is configured server-side."""
+def render_setup():
+    """Render the setup screen for API key entry."""
     st.title("Wiom UAF Communication Briefing Agent")
     st.markdown(
         "Help stakeholders define and validate communication requirements "
         "before submitting to Linear."
     )
-
     st.divider()
 
-    st.info(
-        "No API key is configured on this server. "
-        "Ask your admin to add ANTHROPIC_API_KEY to the deployment secrets, "
-        "or enter one below to get started."
+    provider = st.radio(
+        "Choose AI provider",
+        ["gemini", "anthropic"],
+        format_func=lambda x: "Google Gemini (free)" if x == "gemini" else "Anthropic Claude",
+        index=0,
     )
 
-    api_key = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        placeholder="sk-ant-...",
-        help="Your API key is only stored in the current session and never saved to disk.",
-    )
+    if provider == "gemini":
+        st.info("Get a free API key from https://aistudio.google.com/apikey (just needs a Google account)")
+        api_key = st.text_input(
+            "Google API Key",
+            type="password",
+            placeholder="AIza...",
+        )
+    else:
+        st.info("Get an API key from https://console.anthropic.com/settings/keys")
+        api_key = st.text_input(
+            "Anthropic API Key",
+            type="password",
+            placeholder="sk-ant-...",
+        )
 
-    if st.button("Start Briefing", disabled=not api_key):
+    if st.button("Start Briefing", disabled=not api_key, use_container_width=True):
         try:
-            agent = BriefingAgent(api_key=api_key)
+            agent = BriefingAgent(provider=provider, api_key=api_key)
             st.session_state.agent = agent
-            st.session_state.api_key_set = True
+            st.session_state.started = True
             st.rerun()
         except Exception as e:
-            st.error(f"Failed to initialize: {e}")
+            st.error("Failed to initialize: {}".format(e))
 
 
 def render_chat():
     """Render the chat interface."""
     st.title("Wiom UAF Communication Briefing Agent")
 
-    # Display chat history
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Initialize with opening message
     if not st.session_state.initialized:
         st.session_state.initialized = True
         with st.chat_message("assistant"):
@@ -160,14 +167,11 @@ def render_chat():
                     {"role": "assistant", "content": response}
                 )
 
-    # Chat input
     if user_input := st.chat_input("Describe your communication requirement..."):
-        # Display user message
         with st.chat_message("user"):
             st.markdown(user_input)
         st.session_state.chat_history.append({"role": "user", "content": user_input})
 
-        # Get agent response
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
@@ -177,28 +181,31 @@ def render_chat():
                         {"role": "assistant", "content": response}
                     )
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error("Error: {}".format(e))
 
-        # Rerun to update sidebar progress
         st.rerun()
 
 
 def main():
     st.set_page_config(
         page_title="Wiom UAF Briefing Agent",
-        page_icon="clipboard",
         layout="wide",
     )
 
     init_session()
 
-    if try_auto_start():
-        # API key found in secrets/env - stakeholders land directly in chat
+    if st.session_state.started and st.session_state.agent:
         render_sidebar()
         render_chat()
     else:
-        # No key configured - show manual input as fallback
-        render_api_key_input()
+        # Try auto-start from server secrets/env
+        for provider in ["gemini", "anthropic"]:
+            if try_auto_start(provider):
+                st.rerun()
+                return
+
+        # No key found anywhere - show setup screen
+        render_setup()
 
 
 if __name__ == "__main__":

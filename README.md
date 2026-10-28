@@ -7,61 +7,63 @@ Helps stakeholders define, validate, and document UAF communication requirements
 ```bash
 cd wiom-briefing-agent
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY='your-key-here'
 ```
+
+### Get an API key (pick one)
+
+**Google Gemini (free, recommended):**
+1. Go to https://aistudio.google.com/apikey
+2. Click "Create API Key" (just needs a Google account)
+3. Set it: `export GOOGLE_API_KEY='your-key'`
+
+**Anthropic Claude (paid):**
+1. Go to https://console.anthropic.com/settings/keys
+2. Create a key
+3. Set it: `export ANTHROPIC_API_KEY='your-key'`
 
 ## Usage
 
-### Option 1: Mode selector
+### Mode selector
 ```bash
 python main.py
 ```
-Prompts you to choose between terminal and web.
 
-### Option 2: Terminal (CLI) directly
+### Terminal (CLI)
 ```bash
-python main.py cli
-# or
-python cli.py
+python main.py cli                    # uses Gemini (default)
+python cli.py --provider anthropic    # uses Claude
 ```
 
-CLI commands during a session:
-- `/status` - Show brief completion progress
-- `/brief` - Show all current brief data
-- `/quit` - Exit
-
-### Option 3: Web browser (Streamlit) directly
+### Web browser (Streamlit)
 ```bash
 python main.py web
 # or
 streamlit run app.py
 ```
 
-Opens a chat UI in your browser with a sidebar showing real-time progress.
+## Share with stakeholders (no setup for them)
 
-## Sharing with stakeholders
-
-**For web access (recommended):**
-
-Deploy to Streamlit Cloud:
+### Option 1: Streamlit Cloud (free)
 1. Push this repo to GitHub
-2. Go to [share.streamlit.io](https://share.streamlit.io)
-3. Connect the repo and set `ANTHROPIC_API_KEY` as a secret
-4. Share the URL with stakeholders — they just open the link and chat
+2. Go to https://share.streamlit.io
+3. Connect the repo, set main file to `app.py`
+4. Add secret: `GOOGLE_API_KEY = "your-key"` (or `ANTHROPIC_API_KEY`)
+5. Share the URL - stakeholders just open it and chat
 
-Or deploy anywhere that runs Python (Heroku, Railway, a VM).
+### Option 2: Any server
+```bash
+export GOOGLE_API_KEY='your-key'
+streamlit run app.py --server.port 8501
+```
 
-**For terminal access:**
-Stakeholders need Python 3.10+, the dependencies, and the API key.
+## How the knowledge base works
 
-## Knowledge base
+Every completed brief is saved to `knowledge/completed_briefs/`.
+Every correction is saved to `knowledge/corrections/`.
 
-The agent learns from every completed brief:
-
-- `knowledge/completed_briefs/` - Past briefs saved as JSON
-- `knowledge/corrections/` - Stakeholder feedback and corrections
-
-Past briefs are used as reference context in future sessions. The agent suggests defaults from similar past communications but always confirms with the stakeholder.
+On future sessions, the agent loads past briefs as context and suggests
+defaults from similar communications. It always confirms with the stakeholder
+before applying suggestions.
 
 ## Project structure
 
@@ -70,12 +72,15 @@ wiom-briefing-agent/
 ├── main.py              # Entry point (mode selector)
 ├── app.py               # Streamlit web UI
 ├── cli.py               # Terminal CLI
-├── agent.py             # Core agent logic (shared)
+├── agent.py             # Core agent (Gemini + Anthropic)
 ├── briefing_spec.py     # System prompt and requirement schema
 ├── knowledge_base.py    # Knowledge storage and retrieval
 ├── knowledge/
 │   ├── completed_briefs/
 │   └── corrections/
+├── .streamlit/
+│   ├── config.toml
+│   └── secrets.toml.example
 ├── requirements.txt
 └── README.md
 ```

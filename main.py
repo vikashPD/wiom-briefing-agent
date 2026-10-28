@@ -1,11 +1,10 @@
 """
 Entry point for the Wiom UAF Communication Briefing Agent.
-Lets the user choose between CLI and Streamlit modes.
 
 Usage:
     python main.py          # Interactive mode selector
-    python main.py cli      # Launch CLI directly
-    python main.py web      # Launch Streamlit directly
+    python main.py cli      # Launch CLI (default: Gemini)
+    python main.py web      # Launch Streamlit web UI
 """
 
 import subprocess
@@ -33,6 +32,7 @@ def main():
         mode = "cli" if choice == "1" else "web" if choice == "2" else ""
 
     if mode == "cli":
+        # Pass remaining args to cli.py
         from cli import main as cli_main
         cli_main()
     elif mode in ("web", "streamlit"):

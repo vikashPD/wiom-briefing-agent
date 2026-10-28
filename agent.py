@@ -1,14 +1,15 @@
 """
 Core agent logic for the Wiom UAF Communication Briefing Agent.
 Shared between CLI and Streamlit interfaces.
+Supports Google Gemini (free, default) and Anthropic Claude.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Optional
 
-from anthropic import Anthropic
 from briefing_spec import SYSTEM_PROMPT, get_fresh_schema
 from knowledge_base import (
     get_knowledge_context,
@@ -17,16 +18,16 @@ from knowledge_base import (
     search_briefs,
 )
 
-# --- Tool definitions for Claude ---
+# --- Tool definitions (provider-agnostic) ---
 
-TOOLS = [
+TOOL_DEFS = [
     {
         "name": "update_brief",
         "description": (
             "Update one or more fields in the briefing document. "
             "Call this whenever the stakeholder provides information that fills a requirement."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "updates": {
@@ -72,7 +73,7 @@ TOOLS = [
             "Get the current status of all requirements in the brief. "
             "Use this to check what's complete, missing, or needs attention."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {},
         },
@@ -83,7 +84,7 @@ TOOLS = [
             "Search the knowledge base for similar past briefs. "
             "Use this when the stakeholder describes a communication type you might have seen before."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "query": {
@@ -100,7 +101,7 @@ TOOLS = [
             "Generate the final Linear-ready task document from the completed brief. "
             "Only call this after the stakeholder confirms the brief is ready."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "title": {
@@ -117,7 +118,7 @@ TOOLS = [
             "Save the completed brief to the knowledge base so future sessions can learn from it. "
             "Call this after generating the Linear task and getting stakeholder confirmation."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "title": {
@@ -134,7 +135,7 @@ TOOLS = [
             "Save stakeholder feedback or corrections about a brief. "
             "This helps the agent learn and improve over time."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "brief_title": {
@@ -152,28 +153,76 @@ TOOLS = [
 ]
 
 
+def _tools_for_anthropic():
+    """Convert tool defs to Anthropic format."""
+    return [
+        {
+            "name": t["name"],
+            "description": t["description"],
+            "input_schema": t["parameters"],
+        }
+        for t in TOOL_DEFS
+    ]
+
+
+def _tools_for_gemini():
+    """Convert tool defs to Gemini function declarations."""
+    return [
+        {
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": t["parameters"],
+        }
+        for t in TOOL_DEFS
+    ]
+
+
 class BriefingAgent:
     """
     Core agent that manages the briefing conversation.
     Interface-agnostic: works with both CLI and Streamlit.
+    Supports 'gemini' (default, free) and 'anthropic' providers.
     """
 
-    def __init__(self, api_key: Optional[str] = None):
-        self.client = Anthropic(api_key=api_key) if api_key else Anthropic()
+    def __init__(self, provider: str = "gemini", api_key: Optional[str] = None):
+        self.provider = provider
         self.brief = get_fresh_schema()
-        self.messages: list[dict] = []
-        self.brief_title: Optional[str] = None
+        self.brief_title = None  # type: Optional[str]
+
+        if provider == "gemini":
+            import google.generativeai as genai
+
+            key = api_key or os.environ.get("GOOGLE_API_KEY")
+            if not key:
+                raise ValueError("Google API key is required. Set GOOGLE_API_KEY or pass api_key.")
+            genai.configure(api_key=key)
+            self.model = genai.GenerativeModel(
+                "gemini-2.0-flash",
+                system_instruction=self._build_system_prompt(),
+                tools=[{"function_declarations": _tools_for_gemini()}],
+            )
+            self.chat = self.model.start_chat()
+
+        elif provider == "anthropic":
+            from anthropic import Anthropic
+
+            self.client = Anthropic(api_key=api_key)
+            self.messages = []  # type: list
+
+        else:
+            raise ValueError(f"Unknown provider: {provider}. Use 'gemini' or 'anthropic'.")
 
     def _build_system_prompt(self) -> str:
         """Build system prompt with knowledge context."""
         knowledge = get_knowledge_context()
         if knowledge:
-            return f"{SYSTEM_PROMPT}\n\n# Knowledge from past briefs\n\n{knowledge}"
+            return "{}\n\n# Knowledge from past briefs\n\n{}".format(SYSTEM_PROMPT, knowledge)
         return SYSTEM_PROMPT
 
-    def _handle_tool_call(self, tool_name: str, tool_input: dict) -> str:
-        """Execute a tool call and return the result as a string."""
+    # --- Tool execution (provider-agnostic) ---
 
+    def _handle_tool_call(self, tool_name, tool_input):
+        """Execute a tool call and return the result as a string."""
         if tool_name == "update_brief":
             return self._tool_update_brief(tool_input)
         elif tool_name == "get_brief_status":
@@ -187,39 +236,33 @@ class BriefingAgent:
         elif tool_name == "save_feedback":
             return self._tool_save_feedback(tool_input)
         else:
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+            return json.dumps({"error": "Unknown tool: {}".format(tool_name)})
 
-    def _tool_update_brief(self, tool_input: dict) -> str:
-        """Update fields in the brief."""
+    def _tool_update_brief(self, tool_input):
         updates = tool_input.get("updates", [])
         applied = []
         errors = []
-
         for update in updates:
             section = update["section"]
             field = update["field"]
             value = update["value"]
             status = update["status"]
-
             if section in self.brief and field in self.brief[section]["fields"]:
                 self.brief[section]["fields"][field]["value"] = value
                 self.brief[section]["fields"][field]["status"] = status
-                applied.append(f"{section}.{field} -> {status}")
+                applied.append("{}.{} -> {}".format(section, field, status))
             else:
-                errors.append(f"Unknown field: {section}.{field}")
-
+                errors.append("Unknown field: {}.{}".format(section, field))
         result = {"applied": applied}
         if errors:
             result["errors"] = errors
         return json.dumps(result)
 
-    def _tool_get_brief_status(self) -> str:
-        """Get current brief status summary."""
+    def _tool_get_brief_status(self):
         status = {}
         total = 0
         complete = 0
         missing_mandatory = []
-
         for section_key, section in self.brief.items():
             section_status = {}
             for field_key, field in section["fields"].items():
@@ -233,13 +276,8 @@ class BriefingAgent:
                 if field["status"] == "complete":
                     complete += 1
                 elif field["mandatory"] and field["status"] == "missing":
-                    missing_mandatory.append(f"{section['label']}: {field['label']}")
-
-            status[section_key] = {
-                "label": section["label"],
-                "fields": section_status,
-            }
-
+                    missing_mandatory.append("{}: {}".format(section["label"], field["label"]))
+            status[section_key] = {"label": section["label"], "fields": section_status}
         return json.dumps({
             "sections": status,
             "summary": {
@@ -251,209 +289,92 @@ class BriefingAgent:
             },
         })
 
-    def _tool_search_past_briefs(self, tool_input: dict) -> str:
-        """Search past briefs for reference."""
+    def _tool_search_past_briefs(self, tool_input):
         query = tool_input.get("query", "")
         results = search_briefs(query)
         if not results:
             return json.dumps({"results": [], "message": "No matching past briefs found."})
         return json.dumps({"results": results, "count": len(results)})
 
-    def _tool_generate_linear_task(self, tool_input: dict) -> str:
-        """Generate the final Linear-ready Markdown task."""
+    def _tool_generate_linear_task(self, tool_input):
         title = tool_input.get("title", "UAF Communication Task")
         self.brief_title = title
         task = self._format_linear_task(title)
         return json.dumps({"task_markdown": task, "title": title})
 
-    def _tool_save_completed_brief(self, tool_input: dict) -> str:
-        """Save completed brief to knowledge base."""
+    def _tool_save_completed_brief(self, tool_input):
         title = tool_input.get("title", self.brief_title or "Untitled")
         filepath = save_brief(self.brief, title)
         return json.dumps({"saved": True, "path": filepath})
 
-    def _tool_save_feedback(self, tool_input: dict) -> str:
-        """Save stakeholder feedback."""
+    def _tool_save_feedback(self, tool_input):
         brief_title = tool_input.get("brief_title", "")
         feedback = tool_input.get("feedback", "")
         filepath = save_correction(brief_title, feedback)
         return json.dumps({"saved": True, "path": filepath})
 
-    def _format_linear_task(self, title: str) -> str:
-        """Format the brief as a Linear-ready Markdown task."""
-        lines = [f"# {title}", ""]
+    # --- Provider-specific send logic ---
 
-        # Business context
-        lines.append("## Business Context & Objective")
-        biz = self.brief["A_business_objective"]["fields"]
-        for field in biz.values():
-            val = field["value"] or f"[{field['status'].upper()}]"
-            lines.append(f"- **{field['label']}:** {val}")
-        lines.append("")
-
-        # Audience
-        lines.append("## Audience & Eligibility")
-        aud = self.brief["B_audience_eligibility"]["fields"]
-        for field in aud.values():
-            val = field["value"] or f"[{field['status'].upper()}]"
-            lines.append(f"- **{field['label']}:** {val}")
-        lines.append("")
-
-        # Channels
-        lines.append("## Channel Selection & Configuration")
-        ch = self.brief["C_channel_selection"]["fields"]
-        for field in ch.values():
-            val = field["value"] or f"[{field['status'].upper()}]"
-            lines.append(f"- **{field['label']}:** {val}")
-        lines.append("")
-
-        # Trigger
-        lines.append("## Trigger & Scheduling")
-        tr = self.brief["D_trigger_timing"]["fields"]
-        for field in tr.values():
-            val = field["value"] or f"[{field['status'].upper()}]"
-            lines.append(f"- **{field['label']}:** {val}")
-        lines.append("")
-
-        # Frequency
-        lines.append("## Frequency & Priority Rules")
-        freq = self.brief["E_frequency_priority"]["fields"]
-        for field in freq.values():
-            val = field["value"] or f"[{field['status'].upper()}]"
-            lines.append(f"- **{field['label']}:** {val}")
-        lines.append("")
-
-        # Content
-        lines.append("## Content & Destination")
-        cont = self.brief["F_content_destination"]["fields"]
-        for field in cont.values():
-            val = field["value"] or f"[{field['status'].upper()}]"
-            lines.append(f"- **{field['label']}:** {val}")
-        lines.append("")
-
-        # Measurement
-        lines.append("## Analytics & Success Criteria")
-        meas = self.brief["G_measurement_ownership"]["fields"]
-        for field in meas.values():
-            val = field["value"] or f"[{field['status'].upper()}]"
-            lines.append(f"- **{field['label']}:** {val}")
-        lines.append("")
-
-        # Acceptance criteria
-        lines.append("## Acceptance Criteria")
-        lines.append(self._generate_acceptance_criteria())
-        lines.append("")
-
-        # QA scenarios
-        lines.append("## QA Scenarios")
-        lines.append(self._generate_qa_scenarios())
-        lines.append("")
-
-        # Open questions
-        open_questions = self._collect_open_items()
-        if open_questions:
-            lines.append("## Open Questions & Technical Dependencies")
-            for q in open_questions:
-                lines.append(f"- {q}")
-            lines.append("")
-
-        return "\n".join(lines)
-
-    def _generate_acceptance_criteria(self) -> str:
-        """Generate acceptance criteria from the brief."""
-        criteria = []
-        fields = self.brief
-
-        # Trigger
-        trigger = fields["D_trigger_timing"]["fields"]["trigger_event"]["value"]
-        if trigger:
-            criteria.append(f"- [ ] Communication is triggered when: {trigger}")
-
-        # Audience
-        audience = fields["B_audience_eligibility"]["fields"]["target_audience"]["value"]
-        if audience:
-            criteria.append(f"- [ ] Only shown to: {audience}")
-
-        # Suppression
-        suppression = fields["B_audience_eligibility"]["fields"]["suppression_after_completion"]["value"]
-        if suppression:
-            criteria.append(f"- [ ] Suppressed after completion: {suppression}")
-
-        # Frequency
-        lifetime = fields["E_frequency_priority"]["fields"]["lifetime_cap"]["value"]
-        if lifetime:
-            criteria.append(f"- [ ] Lifetime impression cap enforced: {lifetime}")
-
-        daily = fields["E_frequency_priority"]["fields"]["daily_session_cap"]["value"]
-        if daily:
-            criteria.append(f"- [ ] Daily/session cap enforced: {daily}")
-
-        # CTA
-        cta = fields["F_content_destination"]["fields"]["cta_and_destination"]["value"]
-        if cta:
-            criteria.append(f"- [ ] CTA navigates to: {cta}")
-
-        # Analytics
-        events = fields["G_measurement_ownership"]["fields"]["analytics_events"]["value"]
-        if events:
-            criteria.append(f"- [ ] Analytics events fire correctly: {events}")
-
-        # Channels
-        channels = fields["C_channel_selection"]["fields"]["selected_channels"]["value"]
-        if channels:
-            criteria.append(f"- [ ] Displayed on correct channels: {channels}")
-
-        return "\n".join(criteria) if criteria else "- [ ] [To be generated from completed brief]"
-
-    def _generate_qa_scenarios(self) -> str:
-        """Generate QA test scenarios from the brief."""
-        scenarios = [
-            "- [ ] Eligible user sees the communication on first trigger",
-            "- [ ] Ineligible user never sees the communication",
-            "- [ ] Communication is suppressed after user completes the action",
-        ]
-
-        lifetime = self.brief["E_frequency_priority"]["fields"]["lifetime_cap"]["value"]
-        if lifetime:
-            scenarios.append(f"- [ ] Communication stops after lifetime cap ({lifetime})")
-
-        cooldown = self.brief["E_frequency_priority"]["fields"]["cooldown"]["value"]
-        if cooldown:
-            scenarios.append(f"- [ ] Cooldown of {cooldown} is respected between impressions")
-
-        channels = self.brief["C_channel_selection"]["fields"]["selected_channels"]["value"]
-        if channels and "," in str(channels):
-            scenarios.append("- [ ] Cross-channel suppression works correctly")
-            scenarios.append("- [ ] Channel sequence/timing is respected")
-
-        scenarios.append("- [ ] Dismiss/close behavior works as specified")
-        scenarios.append("- [ ] All analytics events fire with correct payloads")
-        scenarios.append("- [ ] Communication renders correctly in all supported languages")
-
-        return "\n".join(scenarios)
-
-    def _collect_open_items(self) -> list[str]:
-        """Collect all non-complete, non-missing items that need attention."""
-        items = []
-        for section in self.brief.values():
-            for field in section["fields"].values():
-                if field["status"] == "awaiting_technical_confirmation":
-                    items.append(f"[TECH] {field['label']}: {field['value'] or 'Needs confirmation'}")
-                elif field["status"] == "assumption_requiring_approval":
-                    items.append(f"[ASSUMPTION] {field['label']}: {field['value'] or 'Needs approval'}")
-                elif field["status"] == "conditional":
-                    if field["value"]:
-                        items.append(f"[CONDITIONAL] {field['label']}: {field['value']}")
-        return items
-
-    def send_message(self, user_message: str) -> tuple[str, list[dict]]:
+    def send_message(self, user_message):
         """
         Send a user message and get the agent's response.
         Returns (response_text, tool_calls_made).
-        Handles the tool-use loop internally.
         """
-        self.messages.append({"role": "user", "content": user_message})
+        if self.provider == "gemini":
+            return self._send_gemini(user_message)
+        else:
+            return self._send_anthropic(user_message)
 
+    def _send_gemini(self, user_message):
+        """Gemini conversation with tool-use loop."""
+        import google.generativeai as genai
+
+        tool_calls_log = []
+        response = self.chat.send_message(user_message)
+
+        while True:
+            # Check for function calls in response
+            function_calls = []
+            for part in response.candidates[0].content.parts:
+                if part.function_call and part.function_call.name:
+                    function_calls.append(part)
+
+            if not function_calls:
+                break
+
+            # Handle each function call
+            response_parts = []
+            for fc_part in function_calls:
+                fc = fc_part.function_call
+                tool_input = dict(fc.args) if fc.args else {}
+                result_str = self._handle_tool_call(fc.name, tool_input)
+                tool_calls_log.append({
+                    "tool": fc.name,
+                    "input": tool_input,
+                    "result": result_str,
+                })
+                response_parts.append(
+                    genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=fc.name,
+                            response={"result": json.loads(result_str)},
+                        )
+                    )
+                )
+
+            response = self.chat.send_message(response_parts)
+
+        # Extract text from final response
+        text_parts = []
+        for part in response.candidates[0].content.parts:
+            if part.text:
+                text_parts.append(part.text)
+
+        return "\n".join(text_parts), tool_calls_log
+
+    def _send_anthropic(self, user_message):
+        """Anthropic conversation with tool-use loop."""
+        self.messages.append({"role": "user", "content": user_message})
         tool_calls_log = []
 
         while True:
@@ -461,23 +382,18 @@ class BriefingAgent:
                 model="claude-sonnet-4-20250514",
                 max_tokens=4096,
                 system=self._build_system_prompt(),
-                tools=TOOLS,
+                tools=_tools_for_anthropic(),
                 messages=self.messages,
             )
 
-            # Collect assistant content
             assistant_content = response.content
             self.messages.append({"role": "assistant", "content": assistant_content})
 
-            # Check if there are tool uses
-            tool_uses = [block for block in assistant_content if block.type == "tool_use"]
-
+            tool_uses = [b for b in assistant_content if b.type == "tool_use"]
             if not tool_uses:
-                # No tool calls - extract text and return
-                text_parts = [block.text for block in assistant_content if block.type == "text"]
+                text_parts = [b.text for b in assistant_content if b.type == "text"]
                 return "\n".join(text_parts), tool_calls_log
 
-            # Handle tool calls
             tool_results = []
             for tool_use in tool_uses:
                 result = self._handle_tool_call(tool_use.name, tool_use.input)
@@ -493,14 +409,110 @@ class BriefingAgent:
                 })
 
             self.messages.append({"role": "user", "content": tool_results})
-            # Loop continues to get the next response after tool results
 
-    def get_progress(self) -> dict:
+    # --- Linear task formatting ---
+
+    def _format_linear_task(self, title):
+        lines = ["# {}".format(title), ""]
+
+        section_map = [
+            ("A_business_objective", "Business Context & Objective"),
+            ("B_audience_eligibility", "Audience & Eligibility"),
+            ("C_channel_selection", "Channel Selection & Configuration"),
+            ("D_trigger_timing", "Trigger & Scheduling"),
+            ("E_frequency_priority", "Frequency & Priority Rules"),
+            ("F_content_destination", "Content & Destination"),
+            ("G_measurement_ownership", "Analytics & Success Criteria"),
+        ]
+
+        for key, heading in section_map:
+            lines.append("## {}".format(heading))
+            for field in self.brief[key]["fields"].values():
+                val = field["value"] or "[{}]".format(field["status"].upper())
+                lines.append("- **{}:** {}".format(field["label"], val))
+            lines.append("")
+
+        lines.append("## Acceptance Criteria")
+        lines.append(self._generate_acceptance_criteria())
+        lines.append("")
+
+        lines.append("## QA Scenarios")
+        lines.append(self._generate_qa_scenarios())
+        lines.append("")
+
+        open_questions = self._collect_open_items()
+        if open_questions:
+            lines.append("## Open Questions & Technical Dependencies")
+            for q in open_questions:
+                lines.append("- {}".format(q))
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _generate_acceptance_criteria(self):
+        criteria = []
+        b = self.brief
+
+        checks = [
+            ("D_trigger_timing", "trigger_event", "Communication is triggered when"),
+            ("B_audience_eligibility", "target_audience", "Only shown to"),
+            ("B_audience_eligibility", "suppression_after_completion", "Suppressed after completion"),
+            ("E_frequency_priority", "lifetime_cap", "Lifetime impression cap enforced"),
+            ("E_frequency_priority", "daily_session_cap", "Daily/session cap enforced"),
+            ("F_content_destination", "cta_and_destination", "CTA navigates to"),
+            ("G_measurement_ownership", "analytics_events", "Analytics events fire correctly"),
+            ("C_channel_selection", "selected_channels", "Displayed on correct channels"),
+        ]
+
+        for section, field, label in checks:
+            val = b[section]["fields"][field]["value"]
+            if val:
+                criteria.append("- [ ] {}: {}".format(label, val))
+
+        return "\n".join(criteria) if criteria else "- [ ] [To be generated from completed brief]"
+
+    def _generate_qa_scenarios(self):
+        scenarios = [
+            "- [ ] Eligible user sees the communication on first trigger",
+            "- [ ] Ineligible user never sees the communication",
+            "- [ ] Communication is suppressed after user completes the action",
+        ]
+
+        lifetime = self.brief["E_frequency_priority"]["fields"]["lifetime_cap"]["value"]
+        if lifetime:
+            scenarios.append("- [ ] Communication stops after lifetime cap ({})".format(lifetime))
+
+        cooldown = self.brief["E_frequency_priority"]["fields"]["cooldown"]["value"]
+        if cooldown:
+            scenarios.append("- [ ] Cooldown of {} is respected between impressions".format(cooldown))
+
+        channels = self.brief["C_channel_selection"]["fields"]["selected_channels"]["value"]
+        if channels and "," in str(channels):
+            scenarios.append("- [ ] Cross-channel suppression works correctly")
+            scenarios.append("- [ ] Channel sequence/timing is respected")
+
+        scenarios.append("- [ ] Dismiss/close behavior works as specified")
+        scenarios.append("- [ ] All analytics events fire with correct payloads")
+        scenarios.append("- [ ] Communication renders correctly in all supported languages")
+        return "\n".join(scenarios)
+
+    def _collect_open_items(self):
+        items = []
+        for section in self.brief.values():
+            for field in section["fields"].values():
+                if field["status"] == "awaiting_technical_confirmation":
+                    items.append("[TECH] {}: {}".format(field["label"], field["value"] or "Needs confirmation"))
+                elif field["status"] == "assumption_requiring_approval":
+                    items.append("[ASSUMPTION] {}: {}".format(field["label"], field["value"] or "Needs approval"))
+                elif field["status"] == "conditional" and field["value"]:
+                    items.append("[CONDITIONAL] {}: {}".format(field["label"], field["value"]))
+        return items
+
+    def get_progress(self):
         """Get a summary of brief completion progress."""
         total = 0
         complete = 0
         missing_mandatory = 0
-
         for section in self.brief.values():
             for field in section["fields"].values():
                 total += 1
@@ -508,7 +520,6 @@ class BriefingAgent:
                     complete += 1
                 elif field["mandatory"] and field["status"] == "missing":
                     missing_mandatory += 1
-
         return {
             "total": total,
             "complete": complete,
